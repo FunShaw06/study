@@ -178,6 +178,8 @@ pre{white-space:pre-wrap;font-size:12px;background:#f4f6fa;padding:10px;border-r
 </style>
 </head>
 <body>
+  <div id="__err" style="display:none;position:fixed;top:0;left:0;right:0;background:#d1344a;color:#fff;padding:12px;z-index:9999;font-size:13px;word-break:break-all;max-height:60vh;overflow:auto"></div>
+<script>window.addEventListener('error',function(e){var d=document.getElementById('__err');if(d){d.style.display='block';d.textContent='JS错误: '+e.message+' | 行 '+e.lineno+':'+e.colno;}});</script>
 <header class="top">
   <div class="brand">语言学习中心<small>Personal Language Study Center</small></div>
   <nav>
