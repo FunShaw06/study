@@ -241,7 +241,7 @@ window.addEventListener('unhandledrejection', function (e) {
 </script>
 
 <header class="top">
-  <div class="brand">语言学习中心<small>Personal Language Study Center · v9</small></div>
+  <div class="brand">语言学习中心<small>Personal Language Study Center · v10</small></div>
   <nav id="nav">
     <button data-act="nav" data-view="home">首页</button>
     <button data-act="nav" data-view="library">资料库</button>
@@ -384,18 +384,20 @@ function closeModal() {
   m.innerHTML = '';
 }
 
-/* 确认框：ask(标题, 说明, 确认按钮文字, 回调) */
+/* 确认框：ask(标题, 说明, 确认按钮文字, 回调)。
+   用 data-act 事件委托，而不是给按钮挂 onclick ——
+   因为 modal() 是先设 innerHTML 再返回，onclick 很容易挂到已被替换掉的旧节点上（按钮变成死的）。 */
+let askCallback = null;
 function ask(title, msg, okText, cb) {
+  askCallback = cb;
   modal(`<div class="dlg">
     <h3>${esc(title)}</h3>
     <p class="muted">${esc(msg)}</p>
     <div class="btns">
-      <button class="ghost" data-act="close">取消</button>
+      <button class="ghost" data-act="askCancel">取消</button>
       <button class="primary" data-act="askOk">${esc(okText || '确定')}</button>
     </div>
   </div>`);
-  const btn = $('#modal [data-act="askOk"]');
-  if (btn) btn.onclick = () => { closeModal(); cb(); };
 }
 
 function updateVocabBadge() {
@@ -2087,20 +2089,125 @@ async function handleFile(file, idx, total) {
     toast('读取失败：' + msg);
   }
 }
-async function nextFile() {
-  if (!queue.length) return;
-  const f = queue.shift();
-  await handleFile(f, 0, 0);
-}
+
 async function handleFiles(fs) {
   const arr = [...fs];
   if (!arr.length) return;
-  const total = arr.length;
-  bootDiag('📂 已选中 ' + total + ' 个文件，开始处理…' + arr.map(f => f.name).join('、'), false);
-  for (let i = 0; i < arr.length; i++) {
-    await handleFile(arr[i], i + 1, total);
+  if (arr.length > 1) { await fillBatch(arr); return; }   // 多选 → 批量导入
+  await handleFile(arr[0], 1, 1);
+}
+
+/* 单份保存后不需要再调度下一个（批量导入走 confirmBatch） */
+async function nextFile() {}
+
+/* ===================== 批量导入 =====================
+   用户一次选中"15 份真题 + 15 份答案"时，先把所有文件读成文字，
+   然后用一份答案统一套用到每一套卷子上，一次批量保存。
+   这样不会再出现"答案文件把前一份卷子的待保存状态覆盖掉"的问题。 */
+let batch = null;
+
+/* 判断一个文件是"真题卷"还是"答案解析"。
+   做法：用"答案/解析"和"真题"两组关键字各自打分，谁的分高就是谁。
+   这样能同时正确区分：
+     2025年12月大学英语六级真题（第三套）_完整版精排   → 真题（含"真题"，不含"答案"）
+     2025年12月六级真题（第三套）答案解析            → 答案（两组都含，但"答案"更明确）
+*/
+const ANS_WORDS = /答案|解析|answer|keys?/gi;
+const PAPER_WORDS = /真题|试题|试卷|完整版|精排|exam\s*paper/gi;
+
+function looksLikeAnswerDoc(name, text) {
+  const nm = String(name || '');
+  const ansName = (nm.match(ANS_WORDS) || []).length;
+  const papName = (nm.match(PAPER_WORDS) || []).length;
+  if (ansName && !papName) return true;      // 只有"答案/解析" → 答案
+  if (papName && !ansName) return false;     // 只有"真题/精排" → 真题
+  if (ansName && papName) {
+    // 两组都有：看开头内容里有没有答案标识
+    const head = String(text || '').slice(0, 3000);
+    if (/参考答案|答案解析|答案速查|答案\s*[:：]/.test(head)) return true;
+    if (/Directions\s*[:：]/i.test(head)) return false;
+    return true;                              // 默认当答案（当试卷处理会解析不出题，损失更大）
   }
-  bootDiag('✅ 这一批 ' + total + ' 个文件都处理完了。', false);
+  // 文件名没线索，看内容
+  const body = String(text || '');
+  if (/参考答案|答案解析|答案速查/.test(body.slice(0, 3000))) return true;
+  const optMarkers = (body.match(/[A-D][).]\s*[A-Za-z]/g) || []).length;
+  return optMarkers < 5 && countPairs(body.slice(0, 8000)) >= 15;
+}
+
+async function fillBatch(fs) {
+  batch = { papers: [], answers: [] };
+  bootDiag('📂 正在读取 ' + fs.length + ' 个文件…', false);
+  for (let i = 0; i < fs.length; i++) {
+    const f = fs[i];
+    try {
+      bootDiag(`📄 （${i + 1}/${fs.length}）${f.name} 读取中…`, false);
+      const { text, isPdf } = await readAnyFile(f, msg => bootDiag(`📄 （${i + 1}/${fs.length}）${f.name}：${msg}`, false));
+      if (!text || !text.trim()) { batch.answers.push({ name: f.name, text: '', bad: true }); continue; }
+      if (looksLikeAnswerDoc(f.name, text)) {
+        batch.answers.push({ name: f.name, text });
+      } else {
+        const r = parsePaper(text, isPdf);
+        if (r.total > 0) batch.papers.push({ name: f.name, raw: text, isPdf, r });
+        else batch.answers.push({ name: f.name, text });   // 没解析出题目，当答案处理
+      }
+    } catch (e) {
+      batch.answers.push({ name: f.name, text: '', bad: true, err: (e && e.message) || String(e) });
+    }
+  }
+  showBatchDialog();
+}
+
+function showBatchDialog() {
+  if (!batch) return;
+  const ansText = batch.answers.filter(a => a.text).map(a => a.text).join('\n');
+  const rows = batch.papers.map((p, i) => {
+    const secs = p.r.sections.map(s => s.short + ' ' + s.blocks.reduce((n, b) => n + b.questions.length, 0)).join(' · ');
+    return `<li><b>${esc(p.name)}</b><br><span class="muted">${esc(secs)} ｜ 共 ${p.r.total} 题</span></li>`;
+  }).join('');
+  const fileRows = batch.answers.map(a => `<li class="muted">${esc(a.name)}${a.bad ? ' —— <span class="warn" style="display:inline">没读到文字' + (a.err ? '：' + esc(a.err) : '') + '</span>' : ''}</li>`).join('');
+  const totalQ = batch.papers.reduce((n, p) => n + p.r.total, 0);
+
+  modal(`<div class="dlg">
+    <h3>批量导入确认</h3>
+    <p class="muted">已读取 ${batch.papers.length} 份试卷 + ${batch.answers.length} 个答案文件。</p>
+    <p class="muted">识别到 <b>${batch.papers.length}</b> 套试卷，共 <b>${totalQ}</b> 题。</p>
+    ${batch.papers.length ? `<ul class="sum">${rows}</ul>` : '<p class="warn">没有识别到任何试卷。请确认选中的是真题文件。</p>'}
+    ${batch.answers.length ? `<details><summary>用作答案的 ${batch.answers.length} 个文件</summary><ul class="sum">${fileRows}</ul></details>` : '<p class="warn">这次没有选中答案文件，保存后需要自己补充答案（在资料详情页点「补充答案」）。</p>'}
+    <label class="muted" style="display:block;margin-top:8px">答案（这些答案会套用到上面每一套卷子；可手动补充或修改）</label>
+    <textarea id="mAns" style="min-height:90px" placeholder="${esc(ANS_HINT)}">${esc(ansText.slice(0, 20000))}</textarea>
+    <p class="muted" id="mAnsPreview"></p>
+    <div class="btns">
+      <button class="ghost" data-act="close">取消</button>
+      <button class="primary" data-act="confirmBatch"${batch.papers.length ? '' : ' disabled'}>全部保存到资料库</button>
+    </div>
+  </div>`);
+}
+
+function confirmBatch() {
+  if (!batch) return;
+  const fromBox = (($('#mAns') || {}).value || '');
+  // 优先用文本框里（用户可能改过）；拿不到就用已读到的答案原文
+  const av = fromBox.trim() ? fromBox : batch.answers.filter(a => a.text).map(a => a.text).join('\n');
+  let saved = 0, missTotal = 0;
+  batch.papers.forEach(p => {
+    applyAnswerInput(p.r, av);
+    const meta = detectMeta(p.name, p.raw);
+    const label = buildLabel(meta, p.name);
+    const paper = Object.assign({
+      id: 'p_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+      label, sections: p.r.sections, created: Date.now(), hash: contentHash(p.raw)
+    }, meta);
+    papers.push(paper);
+    saved++;
+    const qs = allQuestions(paper);
+    missTotal += qs.filter(q => !q.ans).length;
+  });
+  store.set('plsc_papers', papers);
+  batch = null;
+  closeModal();
+  view = 'library'; render();
+  toast('已保存 ' + saved + ' 套资料' + (missTotal ? '，其中 ' + missTotal + ' 题没有答案' : '，答案齐全'));
 }
 
 /* ===================== 练习 / 模考 ===================== */
@@ -2392,7 +2499,27 @@ function handleAction(el, e) {
 
       case 'pasteText': pasteTextDialog(); break;
 
-      case 'close': closeModal(); break;
+      case 'close': {
+        const hadPending = !!pending;
+        pending = null;
+        askCallback = null;
+        closeModal();
+        if (hadPending) nextFile();     // 取消了这一份，继续处理队列里的下一份
+        break;
+      }
+
+      case 'askOk': {
+        const cb = askCallback;
+        askCallback = null;
+        closeModal();
+        if (typeof cb === 'function') { try { cb(); } catch (e) { toast('操作失败：' + (e.message || e)); } }
+        break;
+      }
+
+      case 'askCancel':
+        askCallback = null;
+        closeModal();
+        break;
 
       case 'detail':
         viewId = el.dataset.id; view = 'detail'; render(); window.scrollTo(0, 0); break;
@@ -2416,6 +2543,8 @@ function handleAction(el, e) {
       case 'saveAnswers': saveAnswersFromDialog(el.dataset.id); break;
 
       case 'savePaper': savePaper(); break;
+
+      case 'confirmBatch': confirmBatch(); break;
 
       case 'showAnsCount': {
         const r = ansCountFromUI();
@@ -2694,7 +2823,7 @@ function boot() {
     }
     const navEl = document.getElementById('nav');
     const navOk = !!(navEl && navEl.querySelectorAll('button').length >= 5);
-    bootDiag('✅ 程序已就绪（v9）：导航 5 个按钮' + (navOk ? '正常' : '异常') +
+    bootDiag('✅ 程序已就绪（v10）：导航 5 个按钮' + (navOk ? '正常' : '异常') +
       '，资料 ' + papers.length + ' 套，生词 ' + vocab.length + ' 个。点「资料库」试试。', false);
     if (!store.diskOK) setTimeout(showStorageWarn, 300);
   } catch (e) {
@@ -2720,7 +2849,7 @@ window.__plsc = {
   get queue() { return queue; }, set queue(v) { queue = v; },
   render, openPreview, startPaper, calc, savePaper, exportAll, buildTree,
   setTab(i) { if (session) session.tab = i; },
-  saveRoute, saveSession, restoreAll,
+  saveRoute, saveSession, restoreAll, confirmBatch, fillBatch,
   get scrollMem() { return scrollMem; },
   countQuestions, countAnswered, allQuestions, DEFAULT_SETTINGS
 };
