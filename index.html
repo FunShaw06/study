@@ -144,6 +144,8 @@ summary{cursor:pointer;color:var(--blue);font-weight:600}
 .pane{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:18px}
 .passage{font:17px/1.85 var(--serif)}
 .passage p{margin:0 0 .9em;max-width:70ch}
+.passage-title{font:700 15px var(--ui);color:var(--blue);background:var(--blue-s);border:1px solid var(--blue);border-radius:8px;padding:6px 12px;margin:0 0 10px;display:inline-block}
+.w-tip{background:var(--warn-s);border:1px solid var(--warn);color:#92400e;border-radius:8px;padding:8px 10px;font-size:12px;margin:0 0 10px}
 .pm{display:inline-block;min-width:1.6em;margin-right:.4em;padding:0 .35em;border-radius:6px;background:var(--ink);color:#fff;font:700 14px var(--ui);text-align:center}
 .w{cursor:pointer;border-radius:3px}
 .w:hover{background:var(--blue-s)}
@@ -239,7 +241,7 @@ window.addEventListener('unhandledrejection', function (e) {
 </script>
 
 <header class="top">
-  <div class="brand">语言学习中心<small>Personal Language Study Center · v7</small></div>
+  <div class="brand">语言学习中心<small>Personal Language Study Center · v9</small></div>
   <nav id="nav">
     <button data-act="nav" data-view="home">首页</button>
     <button data-act="nav" data-view="library">资料库</button>
@@ -339,9 +341,6 @@ let sessionStart = 0, sessionAccum = 0, sessionPaused = false, lastActivity = Da
 
 const DEFAULT_SETTINGS = {
   dailyNew: 10,
-  dailyReview: 50,
-  recognizeSeconds: 10,
-  intervals: '1,2,4,7,15,30',
   autoPauseSeconds: 60,
   warnMissingAnswers: true,
   duplicateCheck: true
@@ -459,19 +458,27 @@ function allQuestions(paper) {
 function countQuestions(paper) { return allQuestions(paper).length; }
 function countAnswered(paper) { return allQuestions(paper).filter(q => q.ans).length; }
 /* ===================== 文本规范化 ===================== */
-/* PDF 抽取会把单词拆成 "Se ction" "P assage O ne"，这里生成容忍空格的单词正则 */
+/* PDF 抽取会把单词拆成 "Se ction" "P assage O ne"，这里生成容忍空格的单词正则。
+   关键：只能用 [ \t]*（横向空白），绝对不能用 \\s* —— \\s 包含换行，
+   会让 "Passage" 的 P 跨过换行匹配到下一行的 "One"，进而把标题行和正文首句一起吃掉。 */
 function word(chars) {
-  return chars.split('').map(c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*').join('');
+  return chars.split('').map(c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[ \\t]*').join('');
 }
 const W_SECTION = word('Section');
 const W_PASSAGE = word('Passage');
 const W_DIRECTIONS = word('Directions');
-const W_ANSWERSHEET = word('Answer') + '\\s*' + word('Sheet');
+const W_ANSWERSHEET = word('Answer') + '[ \\t]*' + word('Sheet');
 const W_STATEMENTS = word('Statements');
-const W_BANKED = word('Banked') + '\\s*' + word('Cloze');
-const W_LONGREAD = '(' + word('Long') + '\\s*' + word('Reading') + '|' + word('Matching') + ')';
-const W_CAREFUL = '(' + word('Careful') + '\\s*' + word('Reading') + '|' + word('Passages') + ')';
-const W_READING = word('Reading') + '\\s*' + word('Comprehension');
+const W_BANKED = word('Banked') + '[ \\t]*' + word('Cloze');
+const W_LONGREAD = '(' + word('Long') + '[ \\t]*' + word('Reading') + '|' + word('Matching') + ')';
+const W_CAREFUL = '(' + word('Careful') + '[ \\t]*' + word('Reading') + '|' + word('Passages') + ')';
+const W_READING = word('Reading') + '[ \\t]*' + word('Comprehension');
+const W_ORD = '(' + word('One') + '|' + word('Two') + '|' + word('Three') + '|1|2|3)';
+/* 说明段结尾紧跟的疑问句（如 "What does self-discipline look like at work?"）
+   其实是文章的标题/首句，绝不能在"去掉说明"时被一起删掉。 */
+const W_ASK = '(?:' + word('What') + '|' + word('How') + '|' + word('Why') + '|' + word('Which') + '|' +
+  word('Who') + '|' + word('When') + '|' + word('Where') + '|' + word('Whose') + ')[^?？\\n]{0,200}[?？]';
+const ASK_TAIL = '(?=[ \\t]*' + W_ASK + ')';
 
 function norm(t) {
   return String(t || '')
@@ -800,14 +807,41 @@ function buildChoice(no, seg, letterSpec) {
 /* 去掉 Directions 说明段：只在字段内找句号，避免贪婪跨段吃正文 */
 function stripDirectionsText(t) {
   let s = String(t || '');
+  // 1) 去掉 Section 标题行
   s = s.replace(new RegExp('^[\\s\\S]*?' + W_SECTION + '\\s*[A-C]\\b[^\\n]*\\n', 'i'), '');
+  // 2) 去掉 "Passage One/Two" 标题行
+  s = s.replace(new RegExp('^\\s*' + W_PASSAGE + '\\s*' + W_ORD + '[^\\n]*\\n?', 'i'), '');
+  // 3) 去掉 Directions 说明段。
+  //    说明段的句末句号可能紧跟着文章的标题疑问句（"…centre. What does X look like?"），
+  //    所以遇到 "句号 + 疑问句" 时要在句号处停下，不能连标题一起吃掉。
   const dm = new RegExp('^[\\s\\S]*?' + W_DIRECTIONS + '\\s*[:：]', 'i').exec(s);
   if (dm) {
     const rest = s.slice(dm[0].length);
-    const dot = rest.search(/[.。]\s*(?:\n|$)/);
-    s = dot >= 0 ? rest.slice(dot + 1) : rest;
+    /* 说明段只占开头几行。所有"找结尾"的搜索都限制在这个范围内，
+       否则会把文章正文里第一个问号/句号当成说明结尾，把标题和首句一起切掉。 */
+    const headLines = rest.split('\n').slice(0, 4).join('\n');
+    const posIn = sub => {
+      let p = sub.search(new RegExp('[.。][ \\t]*(?:\\n|$)' + ASK_TAIL, 'i'));
+      if (p < 0) p = sub.search(/[.。][ \t]*(?:\n|$)/);
+      if (p < 0) p = sub.search(/[.。][ \t]*(?=[A-Z])/);
+      if (p < 0) p = sub.search(/[?？]/);
+      return p;
+    };
+    const pos = posIn(headLines);
+    s = pos >= 0 ? rest.slice(pos + 1) : rest;
   }
   return s.replace(new RegExp('^' + W_DIRECTIONS + '\\s*[:：][^\\n]*\\n?', 'i'), '').trim();
+}
+
+/* 去掉题干的 "Questions 46 to 50 are based on …" 说明句，但保留后面的标题问句 */
+function stripQuestionNote(c) {
+  const noteRe = new RegExp(word('Questions') + '\\s*\\d+\\s*(?:to|-|–)\\s*\\d+\\s*' + word('are') +
+    '\\s*' + word('based') + '\\s*' + word('on') + '[\\s\\S]{0,400}?[.。]\\s*', 'i');
+  return c.replace(noteRe, match => {
+    const cleaned = match.replace(/[.。]\s*$/, '');
+    const ask = new RegExp('(' + W_ASK + ')\\s*$', 'i').exec(cleaned);
+    return ask ? ask[1] + '\n' : '';
+  });
 }
 
 /* 词库：兼容「A) word」逐行排列，也兼容整段挤在一行（"A) appeal B) extravagantly ..."），
@@ -990,12 +1024,11 @@ function parseRead(t, isPdf) {
 
   const blocks = [];
   chunks.forEach(c => {
-    c = c.replace(new RegExp('^' + W_PASSAGE + '\\s*' + ORD + '[^\\n]*\\n?', 'i'), '')
-      .replace(new RegExp(word('Questions') + '?\\s*\\d+\\s*(?:' + word('to') + '|-|–)\\s*\\d+\\s*' + word('are') + '\\s*' + word('based') + '\\s*' + word('on') + '[^.\\n]*\\.?', 'i'), '')
-      .replace(new RegExp('^[ \\t]*' + W_SECTION + '\\s*C[^\\n]*\\n?', 'i'), '')
+    c = stripDirectionsText(c);
+    c = stripQuestionNote(c);
+    c = c.replace(new RegExp('^[ \\t]*' + W_SECTION + '\\s*C[^\\n]*\\n?', 'i'), '')
       .replace(/^[ \t]*仔细阅读[ \t]*\n?/i, '')
       .trim();
-    c = stripDirectionsText(c);
     const sq = seqInRange(c, 40, 60);
     if (!sq.length) return;
     const passage = paragraphs(c.slice(0, sq[0].s), isPdf);
@@ -1374,8 +1407,12 @@ function jumpToAnswer(no) {
 }
 
 /* ===================== 渲染入口 ===================== */
+/* 记住滚动位置：整页重绘（选题/选词/收藏生词）后把位置还原回去，
+   否则在平板上每点一下就会被弹回页面顶部。 */
+const scrollMem = { win: 0, panes: [] };
+
 function render(keepScroll) {
-  const y = window.scrollY;
+  if (keepScroll) captureScroll();
   vocabSet = new Set(vocab.map(v => v.w));
   const app = $('#app');
   let html = '';
@@ -1385,18 +1422,30 @@ function render(keepScroll) {
     case 'detail': html = detailHTML(); break;
     case 'test': html = testHTML(); break;
     case 'vocab': html = vocabHTML(); break;
-    case 'review': html = reviewHTML(); break;
     case 'history': html = historyHTML(); break;
     case 'settings': html = settingsHTML(); break;
     default: html = homeHTML();
   }
   app.innerHTML = html;
   // 导航高亮
-  const navView = view === 'detail' || view === 'test' ? 'library' : (view === 'review' ? 'vocab' : view);
+  const navView = view === 'detail' || view === 'test' ? 'library' : view;
   $$('#nav button').forEach(b => b.classList.toggle('on', b.dataset.view === navView));
   updateVocabBadge();
   checkStorageSize();
-  if (keepScroll) window.scrollTo(0, y);
+  if (keepScroll) restoreScroll();
+  saveRoute();
+  saveSession();
+}
+
+/* 记录当前滚动位置（窗口 + 每个可滚动的 pane） */
+function captureScroll() {
+  scrollMem.win = window.scrollY || window.pageYOffset || 0;
+  scrollMem.panes = $$('.pane').map(p => p.scrollTop || 0);
+}
+function restoreScroll() {
+  const panes = $$('.pane');
+  panes.forEach((p, i) => { if (scrollMem.panes[i] != null) p.scrollTop = scrollMem.panes[i]; });
+  if (scrollMem.win) window.scrollTo(0, scrollMem.win);
 }
 
 function noticeHTML() {
@@ -1422,18 +1471,16 @@ function todayStats() {
   const right = todays.reduce((n, h) => n + (h.right || 0), 0);
   return {
     seconds, qs, right,
-    acc: qs ? Math.round(right / qs * 100) : null,
-    due: dueWords().length
+    acc: qs ? Math.round(right / qs * 100) : null
   };
 }
 
 function homeHTML() {
   const st = todayStats();
-  const due = st.due;
   const needAns = papers.filter(p => countQuestions(p) > countAnswered(p)).length;
 
   let plan = [];
-  if (due) plan.push({ t: '复习 ' + due + ' 个生词', d: '预计 ' + Math.max(1, Math.round(due * 0.5)) + ' 分钟，趁记忆还没淡', act: 'startReview', btn: '开始复习' });
+  if (vocab.length) plan.push({ t: '生词本里有 ' + vocab.length + ' 个词', d: '空闲时翻一翻，眼熟为主', act: 'nav', view2: 'vocab', btn: '看生词本' });
   if (needAns) plan.push({ t: '给 ' + needAns + ' 套资料补充答案', d: '答案不全的卷子不计分，补上才能算分', act: 'nav', view2: 'library', btn: '去资料库' });
   const unDone = papers.find(p => !history.some(h => h.paperId === p.id));
   if (unDone) plan.push({ t: '做一套没做过的题', d: esc(unDone.label), act: 'start', id: unDone.id, btn: '开始练习' });
@@ -1446,9 +1493,8 @@ function homeHTML() {
       <div class="stat">学习时长<b>${fmtDuration(st.seconds)}</b></div>
       <div class="stat">练习题数<b>${st.qs}</b></div>
       <div class="stat ${st.acc === null ? '' : (st.acc >= 60 ? 'ok' : 'warn')}">正确率<b>${st.acc === null ? '—' : st.acc + '%'}</b></div>
-      <div class="stat ${due ? 'warn' : 'ok'}">待复习<b>${due}</b></div>
+      <div class="stat">生词<b>${vocab.length}</b></div>
     </div>
-    ${due ? `<p class="muted">复习预计需要 ${Math.max(1, Math.round(due * 0.5))} 分钟。</p>` : ''}
   </section>
 
   <section class="card">
@@ -1650,9 +1696,16 @@ function testHTML() {
     ${s.mock && !s.submitted ? `<span class="timer${s.timeLeft <= 300 ? ' warn' : ''}" id="countdown">${fmtTimer(s.timeLeft)}</span>` : ''}
   </div>`;
   if (s.submitted) h += resultHTML();
+  h += '<p class="w-tip">💡 文章和题目里的<b>英文单词都可以点</b>，点一下就加进生词本（变黄）。</p>';
   h += '<div class="tabs">' + p.sections.map((se, i) =>
     `<button class="tab${i === s.tab ? ' on' : ''}" data-act="tab" data-i="${i}">${esc(se.short)}<i>已答 ${counts[i].d} / ${counts[i].t}</i></button>`).join('') + '</div>';
-  if (sec) h += blockHTML(sec, sec.blocks[0]);
+  /* 一个 Section 可能有多个 block（仔细阅读有两篇文章），必须全部渲染。
+     曾经只渲染 blocks[0]，导致 51-55 题整篇消失。 */
+  if (sec) (sec.blocks || []).forEach((b, bi) => {
+    const many = (sec.blocks || []).length > 1;
+    h += (many && sec.type === 'read' ? `<div class="passage-title">Passage ${bi === 0 ? 'One' : bi === 1 ? 'Two' : (bi + 1)}</div>` : '')
+      + blockHTML(sec, b);
+  });
   if (!s.submitted) h += `<div class="bar"><span>已答 ${done} / ${all}</span><button class="primary" data-act="submit">提交</button></div>`;
   else h += `<div class="bar"><span>本次得分 ${calc().score}</span><button class="primary" data-act="nav" data-view="library">返回资料库</button></div>`;
   return h;
@@ -1669,30 +1722,23 @@ function resultHTML() {
   </div>`;
 }
 
-/* ===================== 生词本 ===================== */
-function dueWords() {
-  const now = Date.now();
-  return vocab.filter(v => !v.mastered && (!v.nextReview || v.nextReview <= now));
-}
-function allActiveVocab() { return vocab.filter(v => !v.mastered); }
+/* ===================== 生词本（纯列表，只有"加生词"） ===================== */
+function vocabList() { return vocab; }
 
 function vocabHTML() {
-  const due = dueWords();
   const now = Date.now();
-  const todayNew = vocab.filter(v => v.t && (now - v.t) < DAY).length;
-  const mastered = vocab.filter(v => v.mastered).length;
+  const last7 = vocab.filter(v => v.t && (now - v.t) < 7 * DAY).length;
+  const srcs = [...new Set(vocab.map(v => v.source).filter(Boolean))];
   const langs = [...new Set(vocab.map(v => v.language || '未分类'))];
 
   let h = `<section class="card"><h2>生词本</h2>
     <div class="statgrid">
       <div class="stat">全部生词<b>${vocab.length}</b></div>
-      <div class="stat ${due.length ? 'warn' : ''}">今日待复习<b>${due.length}</b></div>
-      <div class="stat">已掌握<b>${mastered}</b></div>
-      <div class="stat">24h 内新增<b>${todayNew}</b></div>
+      <div class="stat">近 7 天新增<b>${last7}</b></div>
+      <div class="stat">来源资料<b>${srcs.length}</b></div>
     </div>`;
-  if (due.length) h += `<div class="btns" style="justify-content:flex-start;margin-bottom:10px"><button class="primary" data-act="startReview">开始复习（${due.length}）</button></div>`;
   if (!vocab.length) {
-    h += '<p class="empty">还没有生词。做阅读时点一下文章里的单词就能加入生词本。</p>';
+    h += '<p class="empty">还没有生词。<br>做阅读时，点文章或题目里的英文单词就能加进来。</p>';
   } else {
     h += `<div class="row" style="margin-bottom:8px">
       <label>搜索<input type="text" id="vq" placeholder="输入单词" value="${esc(vocabQuery)}"></label>
@@ -1702,83 +1748,18 @@ function vocabHTML() {
     if (vocabQuery) list = list.filter(v => v.w.toLowerCase().includes(vocabQuery.toLowerCase()));
     if (reviewLangFilter) list = list.filter(v => (v.language || '未分类') === reviewLangFilter);
     h += list.length
-      ? '<ul class="vlist">' + list.map(v => {
-        const isDue = !v.mastered && (!v.nextReview || v.nextReview <= now);
-        return `<li><div class="vbody">
-          <div class="vw">${esc(v.w)}${v.mastered ? ' <span class="mini" style="color:var(--ok)">已掌握</span>' : ''}</div>
-          <input class="vocab-meaning" data-act="editMeaning" data-w="${esc(v.w)}" value="${esc(v.meaning || '')}" placeholder="填写释义（可空）">
-          <div class="vsen">${esc(v.sentence || '暂无原句')}</div>
-          <div class="vsrc">${esc(v.source || '未知来源')}${v.nextReview && !v.mastered ? ' · 下次复习 ' + fmtDate(v.nextReview) : ''}${isDue ? ' · <b>待复习</b>' : ''}</div>
-          <div class="vocab-actions"><button class="${v.mastered ? 'mastered' : ''}" data-act="toggleMastered" data-w="${esc(v.w)}">${v.mastered ? '取消掌握' : '标记已掌握'}</button></div>
-        </div><button class="x" data-act="delWord" data-w="${esc(v.w)}">×</button></li>`;
-      }).join('') + '</ul>'
+      ? '<ul class="vlist">' + list.map(v => `
+        <li>
+          <div class="vbody">
+            <div class="vw">${esc(v.w)}</div>
+            <div class="vsen">${esc(v.sentence || '暂无原句')}</div>
+            <div class="vsrc">${esc(v.source || '未知来源')}${v.t ? ' · ' + fmtDate(v.t) : ''}</div>
+          </div>
+          <button class="x" data-act="delWord" data-w="${esc(v.w)}" title="移出生词本">×</button>
+        </li>`).join('') + '</ul>'
       : '<p class="empty">没有匹配的生词。</p>';
   }
   return h + '</section>';
-}
-
-/* ===================== 复习页 ===================== */
-function makeBlankedSentence(sentence, word) {
-  if (!sentence) return '';
-  const re = new RegExp('\\b' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\w{0,3}\\b', 'gi');
-  let done = false;
-  const out = sentence.replace(re, m => {
-    if (done) return m;
-    done = true;
-    return '<u>' + '_'.repeat(Math.max(4, m.length)) + '</u>';
-  });
-  if (!done) {
-    const re2 = new RegExp('\\w*' + word.slice(0, Math.max(3, word.length - 2)) + '\\w*', 'i');
-    return sentence.replace(re2, m => '<u>' + '_'.repeat(Math.max(4, m.length)) + '</u>');
-  }
-  return out;
-}
-
-function reviewHTML() {
-  const s = session;
-  if (!s || !s.review) return '<section class="card"><h2>今日复习</h2><p class="empty">没有正在进行的复习。</p><div class="btns"><button class="primary" data-act="nav" data-view="vocab">返回生词本</button></div></section>';
-  const v = s.reviewList[s.reviewIndex];
-  if (!v) {
-    return `<section class="card"><h2>今日复习完成</h2>
-      <p class="muted">本轮复习了 ${s.reviewList.length} 个词。</p>
-      <div class="btns"><button class="primary" data-act="nav" data-view="vocab">返回生词本</button>
-      <button class="ghost" data-act="startReview">再复习一轮</button></div></section>`;
-  }
-  const blanked = makeBlankedSentence(v.sentence || '', v.w);
-  const meaning = v.meaning ? esc(v.meaning) : '<span class="empty-m">释义待补充（可在生词本里填）</span>';
-  const stage = s.stage || 'input';
-  let answerHTML = '';
-  if (stage === 'done') {
-    const ok = s.resultFlash === 'ok';
-    answerHTML = `<div class="review-answer ${ok ? 'ok' : 'no'}">${ok ? '✓ 拼写正确' : '✗ 正确拼写：' + esc(v.w)}</div>`;
-  }
-  let actions;
-  if (stage === 'input') {
-    actions = `<div class="review-actions"><button class="primary" data-act="reviewSubmit">提交</button><button class="ghost" data-act="reviewSkip">跳过</button></div>`;
-  } else {
-    actions = `<p class="mini" style="margin-top:10px">凭你的记忆判断：</p>
-      <div class="review-actions">
-        <button class="rec" data-act="rate" data-rate="again">不认识</button>
-        <button class="rec" data-act="rate" data-rate="hard">模糊</button>
-        <button class="rec" data-act="rate" data-rate="good">认识</button>
-      </div>`;
-  }
-  const inputCls = stage === 'done' ? (s.resultFlash === 'ok' ? 'ok' : 'no') : '';
-  return `<section class="card">
-    <h2>今日复习 <span class="muted" style="font-size:13px;font-weight:400">${s.reviewIndex + 1} / ${s.reviewList.length}</span></h2>
-    <div class="review-card">
-      <div class="review-head">
-        <h3 class="review-word">${esc(v.w)}</h3>
-        <span class="review-timer" id="review-timer">计时 0 / ${settings.recognizeSeconds} 秒</span>
-      </div>
-      <div class="review-meaning">${meaning}</div>
-      <div class="review-blank">${blanked || '<span class="muted">（原句缺失，请直接输入单词）</span>'}</div>
-      <input class="review-input ${inputCls}" id="reviewInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
-        value="${esc(s.reviewInput || '')}" placeholder="在此输入单词" ${stage === 'done' ? 'disabled' : ''}>
-      ${answerHTML}
-      ${actions}
-    </div>
-  </section>`;
 }
 
 /* ===================== 记录页 ===================== */
@@ -1876,11 +1857,8 @@ function settingsHTML() {
   </div>`;
   return `
   <section class="card"><h2>设置</h2>
-    ${row('sDailyNew', '每日新词上限', '每天最多新加入多少个生词（仅作提醒，不强制拦截）', settings.dailyNew)}
-    ${row('sDailyReview', '每日复习上限', '一轮复习最多复习多少个词', settings.dailyReview)}
-    ${row('sRecognize', '认识判定秒数', '看到单词后超过这个时间才想起，建议自评选「模糊」', settings.recognizeSeconds)}
-    ${row('sIntervals', '复习间隔（天）', '逗号分隔。答对进入下一档，答错退回第一档', settings.intervals, 'text')}
-    ${row('sAutoPause', '无操作暂停秒数', '这么久没动鼠标键盘就停止计时，避免刷时长', settings.autoPauseSeconds)}
+    ${row('sAutoPause', '无操作暂停秒数', '这么久没动屏幕就停止计时，避免刷时长', settings.autoPauseSeconds)}
+    ${row('sDailyNew', '每日新词提醒值', '生词本里新词超过这个数时，首页会提示你（仅提醒，不拦你）', settings.dailyNew)}
     <div class="setting-row">
       <div><div class="lbl">重复导入提醒</div><div class="desc">导入内容重复的资料时给出提示</div></div>
       <div class="muted">${settings.duplicateCheck ? '已开启' : '已关闭'}</div>
@@ -2244,56 +2222,66 @@ function toggleWord(w, sentence) {
   $$('.w').forEach(el => { if (el.dataset.w === w) el.classList.toggle('saved', vocabSet.has(w)); });
 }
 
-/* ===================== 复习流程 ===================== */
-function intervals() {
-  const arr = String(settings.intervals || '1,2,4,7,15,30').split(',').map(s => +s.trim()).filter(n => n > 0);
-  return arr.length ? arr : [1, 2, 4, 7, 15, 30];
+/* ===================== 刷新记忆（页面 / 正在做的题都要记住） ===================== */
+function saveRoute() {
+  store.set('plsc_route', { view, viewId: viewId || null, at: Date.now() });
 }
 
-function startReview() {
-  const now = Date.now();
-  const list = dueWords()
-    .filter(v => !reviewLangFilter || (v.language || '未分类') === reviewLangFilter)
-    .slice(0, settings.dailyReview || 50);
-  if (!list.length) { toast('今天没有需要复习的生词'); return; }
-  session = { review: true, reviewList: list, reviewIndex: 0, stage: 'input', reviewInput: '', reviewStartAt: Date.now(), resultFlash: null };
-  view = 'review'; render();
-  startReviewTimer();
+/* 保存当前做题进度：只存 paperId + 你的作答，避免重复存储整套题 */
+function saveSession() {
+  if (!session || session.review) { store.remove('plsc_session_live'); return; }
+  if (session.submitted) { store.remove('plsc_session_live'); return; }
+  try {
+    store.set('plsc_session_live', {
+      paperId: session.paper.id,
+      answers: session.answers,
+      tab: session.tab,
+      active: session.active,
+      mock: !!session.mock,
+      timeLeft: session.timeLeft,
+      startedAt: session.startedAt || Date.now(),
+      at: Date.now()
+    });
+  } catch (e) { /* 存储满就算了，不影响做题 */ }
 }
 
-let reviewTimerHandle = null;
-function startReviewTimer() {
-  clearInterval(reviewTimerHandle);
-  reviewTimerHandle = setInterval(() => {
-    if (!session || !session.review || session.stage !== 'input') return;
-    const el = $('#review-timer');
-    if (!el) return;
-    const secs = Math.floor((Date.now() - session.reviewStartAt) / 1000);
-    const limit = settings.recognizeSeconds || 10;
-    if (secs >= limit) {
-      el.classList.add('over');
-      el.textContent = '超过 ' + limit + ' 秒（建议判定为不熟）';
-    } else {
-      el.classList.toggle('warn', secs >= limit * 0.7);
-      el.textContent = '计时 ' + secs + ' / ' + limit + ' 秒';
+/* 启动时恢复：先恢复页面，再恢复做题进度 */
+function restoreAll() {
+  // 1) 正在做的题
+  const live = store.get('plsc_session_live', null);
+  if (live && live.paperId) {
+    const paper = papers.find(p => p.id === live.paperId);
+    if (paper) {
+      const qmap = {};
+      paper.sections.forEach(sec => sec.blocks.forEach(b => b.questions.forEach(q => { q.type = sec.type; qmap[q.no] = q; })));
+      // 关闭期间过掉的时间要扣掉（模考计时是要算真实时间的）
+      let timeLeft = live.timeLeft;
+      if (live.mock && timeLeft != null && live.at) {
+        timeLeft = Math.max(0, timeLeft - Math.round((Date.now() - live.at) / 1000));
+      }
+      session = {
+        paper, answers: live.answers || {}, submitted: false, tab: live.tab || 0, qmap,
+        active: live.active != null ? live.active : null,
+        mock: !!live.mock, timeLeft, historySaved: false,
+        startedAt: live.startedAt || Date.now()
+      };
+      viewId = paper.id; view = 'test';
+      return;
     }
-  }, 1000);
-}
-
-function updateVocabAfterReview(v, rate) {
-  const iv = intervals();
-  if (rate === 'good') {
-    v.level = Math.min((v.level || 0) + 1, iv.length - 1);
-    v.interval = iv[v.level];
-  } else if (rate === 'hard') {
-    v.interval = Math.max(1, v.interval || 1);
-  } else {
-    v.level = 0;
-    v.interval = iv[0];
+    store.remove('plsc_session_live');
   }
-  v.reps = (v.reps || 0) + 1;
-  v.lastReview = Date.now();
-  v.nextReview = Date.now() + v.interval * DAY;
+  // 2) 只是普通的页面刷新
+  const route = store.get('plsc_route', null);
+  if (route && route.view) {
+    const okView = ['home', 'library', 'vocab', 'history', 'settings', 'detail'];
+    if (okView.includes(route.view)) {
+      view = route.view;
+      if (view === 'detail') {
+        viewId = papers.some(p => p.id === route.viewId) ? route.viewId : null;
+        if (!viewId) view = 'library';
+      }
+    }
+  }
 }
 
 /* ===================== 导出 / 导入备份 ===================== */
@@ -2388,7 +2376,7 @@ function handleAction(el, e) {
       case 'nav':
         if (session && view === 'test' && !session.submitted && !session.review) {
           if (!confirm('练习还没提交，确定离开吗？进度不会保存。')) return;
-          clearInterval(timerHandle); session = null;
+          clearInterval(timerHandle); session = null; store.remove('plsc_session_live');
         }
         view = el.dataset.view; viewId = null; render(); window.scrollTo(0, 0); break;
 
@@ -2489,7 +2477,8 @@ function handleAction(el, e) {
 
       case 'quitTest': {
         if (session && !session.submitted && !confirm('退出后本次作答不会保存，确定吗？')) break;
-        clearInterval(timerHandle); session = null; view = 'library'; render();
+        clearInterval(timerHandle); session = null; store.remove('plsc_session_live');
+        view = 'library'; render();
         break;
       }
 
@@ -2500,58 +2489,6 @@ function handleAction(el, e) {
         vocab = vocab.filter(v => v.w !== w);
         saveVocab(); render(true);
         toast('已移出生词本：' + w);
-        break;
-      }
-
-      case 'toggleMastered': {
-        const v = vocab.find(x => x.w === el.dataset.w);
-        if (!v) break;
-        v.mastered = !v.mastered;
-        saveVocab(); render(true);
-        toast(v.mastered ? '已标记为掌握（不再复习）' : '已取消掌握');
-        break;
-      }
-
-      case 'startReview': startReview(); break;
-
-      case 'reviewSubmit': {
-        if (!session || !session.review) break;
-        const v = session.reviewList[session.reviewIndex];
-        const inp = $('#reviewInput');
-        const val = (inp ? inp.value : '').trim();
-        if (!val) { toast('请先输入单词'); break; }
-        session.reviewInput = val;
-        session.resultFlash = (val.toLowerCase() === String(v.w).toLowerCase()) ? 'ok' : 'no';
-        session.stage = 'done';
-        clearInterval(reviewTimerHandle);
-        render();
-        const i2 = $('#reviewInput');
-        if (i2) i2.focus();
-        break;
-      }
-
-      case 'reviewSkip': {
-        if (!session || !session.review) break;
-        session.stage = 'done';
-        session.resultFlash = 'no';
-        clearInterval(reviewTimerHandle);
-        render();
-        break;
-      }
-
-      case 'rate': {
-        if (!session || !session.review) break;
-        const v = session.reviewList[session.reviewIndex];
-        updateVocabAfterReview(v, el.dataset.rate);
-        saveVocab();
-        session.reviewIndex++;
-        session.stage = 'input';
-        session.reviewInput = '';
-        session.resultFlash = null;
-        session.reviewStartAt = Date.now();
-        render(); window.scrollTo(0, 0);
-        if (session.reviewIndex < session.reviewList.length) startReviewTimer();
-        else toast('本轮复习完成');
         break;
       }
 
@@ -2575,8 +2512,9 @@ function handleAction(el, e) {
 
       case 'wipeAll':
         ask('清空所有数据', '资料、生词、记录、设置会全部删除，且不可恢复。建议先导出备份。', '确认清空', () => {
-          ['plsc_papers', 'plsc_vocab', 'plsc_history', 'plsc_settings'].forEach(k => store.remove(k));
+          ['plsc_papers', 'plsc_vocab', 'plsc_history', 'plsc_settings', 'plsc_session_live', 'plsc_route'].forEach(k => store.remove(k));
           papers = []; vocab = []; history = []; settings = Object.assign({}, DEFAULT_SETTINGS);
+          session = null;
           view = 'home'; viewId = null; render(); toast('已清空所有数据');
         });
         break;
@@ -2597,25 +2535,16 @@ function bindInputEvents() {
       if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch (err) {} }
     } else if (el.id === 'vlang') {
       reviewLangFilter = el.value; render(true);
-    } else if (el.dataset && el.dataset.act === 'editMeaning') {
-      const v = vocab.find(x => x.w === el.dataset.w);
-      if (v) { v.meaning = el.value; store.set('plsc_vocab', vocab); }
     }
   });
   document.addEventListener('change', e => {
-    if (e.target.id === 'vlang') { reviewLangFilter = e.target.value; render(true); }
+    if (e.target && e.target.id === 'vlang') { reviewLangFilter = e.target.value; render(true); }
   });
 
-  // 键盘
+  // 键盘：答案框 Ctrl+Enter 直接保存
   document.addEventListener('keydown', e => {
     if (e.key !== 'Enter') return;
-    if (e.target && e.target.id === 'reviewInput') {
-      if (session && session.review && session.stage === 'input') {
-        e.preventDefault();
-        const btn = $('[data-act="reviewSubmit"]');
-        if (btn) btn.click();
-      }
-    } else if (e.target && e.target.id === 'mAns' && e.ctrlKey) {
+    if (e.target && e.target.id === 'mAns' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       savePaper();
     }
@@ -2723,12 +2652,8 @@ function saveSettingsFromUI() {
     const v = parseInt((($('#' + id) || {}).value || '').trim(), 10);
     return isNaN(v) ? d : v;
   };
-  const iv = (($('#sIntervals') || {}).value || '').trim();
   settings.dailyNew = clamp(num('sDailyNew', DEFAULT_SETTINGS.dailyNew), 1, 999);
-  settings.dailyReview = clamp(num('sDailyReview', DEFAULT_SETTINGS.dailyReview), 1, 999);
-  settings.recognizeSeconds = clamp(num('sRecognize', DEFAULT_SETTINGS.recognizeSeconds), 1, 600);
   settings.autoPauseSeconds = clamp(num('sAutoPause', DEFAULT_SETTINGS.autoPauseSeconds), 5, 3600);
-  if (iv) settings.intervals = iv.split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0).join(',') || DEFAULT_SETTINGS.intervals;
   saveSettings();
   render();
   toast('设置已保存');
@@ -2753,6 +2678,8 @@ function boot() {
     loadAll();
     steps.push('loaded');
     vocabSet = new Set(vocab.map(v => v.w));
+    restoreAll();                 // 恢复上次的页面 / 未做完的题
+    steps.push('restored');
     bindEvents();
     bindInputEvents();
     steps.push('bound');
@@ -2767,7 +2694,7 @@ function boot() {
     }
     const navEl = document.getElementById('nav');
     const navOk = !!(navEl && navEl.querySelectorAll('button').length >= 5);
-    bootDiag('✅ 程序已就绪（v7）：导航 5 个按钮' + (navOk ? '正常' : '异常') +
+    bootDiag('✅ 程序已就绪（v9）：导航 5 个按钮' + (navOk ? '正常' : '异常') +
       '，资料 ' + papers.length + ' 套，生词 ' + vocab.length + ' 个。点「资料库」试试。', false);
     if (!store.diskOK) setTimeout(showStorageWarn, 300);
   } catch (e) {
@@ -2793,6 +2720,8 @@ window.__plsc = {
   get queue() { return queue; }, set queue(v) { queue = v; },
   render, openPreview, startPaper, calc, savePaper, exportAll, buildTree,
   setTab(i) { if (session) session.tab = i; },
+  saveRoute, saveSession, restoreAll,
+  get scrollMem() { return scrollMem; },
   countQuestions, countAnswered, allQuestions, DEFAULT_SETTINGS
 };
 
