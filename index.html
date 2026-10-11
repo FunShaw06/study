@@ -241,7 +241,7 @@ window.addEventListener('unhandledrejection', function (e) {
 </script>
 
 <header class="top">
-  <div class="brand">语言学习中心<small>Personal Language Study Center · v10</small></div>
+  <div class="brand">语言学习中心<small>Personal Language Study Center · v11</small></div>
   <nav id="nav">
     <button data-act="nav" data-view="home">首页</button>
     <button data-act="nav" data-view="library">资料库</button>
@@ -2135,6 +2135,55 @@ function looksLikeAnswerDoc(name, text) {
   return optMarkers < 5 && countPairs(body.slice(0, 8000)) >= 15;
 }
 
+/* 从文件名里抽出"年份+月份+第几套"，用于把每份答案配到对应的卷子上。
+   例：'2025年12月大学英语六级真题（第三套）_完整版精排' → '2025|12|3'
+       '2026年6月大学英语六级真题（第1套）'              → '2026|6|1'
+   这一步至关重要：批量导入时如果把所有答案混在一起套到每套卷子上，
+   每套卷子的同一题号都会拿到同一份答案 —— 那就是"答案全错"。 */
+const SET_MAP = { '一': '1', '二': '2', '三': '3', '四': '4', '五': '5', '六': '6' };
+function ansSignature(name) {
+  const nm = String(name || '');
+  const ym = /(20\d{2})\s*年\s*(\d{1,2})\s*月/.exec(nm);
+  const y = ym ? ym[1] : '';
+  const mo = ym ? String(+ym[2]) : '';
+  let s = '';
+  let mm = /第\s*([一二三四五六1-6])\s*套/.exec(nm);
+  if (mm) s = SET_MAP[mm[1]] || mm[1];
+  if (!s) { mm = /(?:set|套)\s*[_\-\s]*([1-6])\b/i.exec(nm); if (mm) s = mm[1]; }
+  if (!s) { mm = /[_\-（(]\s*([1-3])\s*[)）]\s*$/.exec(nm.replace(/\.[a-z0-9]+$/i, '')); if (mm) s = mm[1]; }
+  return y + '|' + mo + '|' + s;
+}
+
+/* 配对：先按完整档案号，再按"年月"放宽（万一答案文件名没写套数），最后按顺序兜底 */
+function pairByAnswerSignature(papers, answers) {
+  const used = new Array(answers.length).fill(false);
+  const out = new Array(papers.length).fill(null);
+  const sig = answers.map(a => ansSignature(a.name));
+  // 1) 完整匹配
+  papers.forEach((p, i) => {
+    const k = ansSignature(p.name);
+    if (!k.replace(/\|/g, '')) return;
+    const j = sig.findIndex((s, idx) => !used[idx] && s === k);
+    if (j >= 0) { used[j] = true; out[i] = j; }
+  });
+  // 2) 年月匹配（忽略套数）
+  const ymOf = s => s.split('|').slice(0, 2).join('|');
+  papers.forEach((p, i) => {
+    if (out[i] != null) return;
+    const k = ymOf(ansSignature(p.name));
+    if (!k.replace(/\|/g, '')) return;
+    const j = sig.findIndex((s, idx) => !used[idx] && ymOf(s) === k);
+    if (j >= 0) { used[j] = true; out[i] = j; }
+  });
+  // 3) 顺序兜底：剩下的卷子和剩下的答案一一对应
+  papers.forEach((p, i) => {
+    if (out[i] != null) return;
+    const j = used.findIndex(u => !u);
+    if (j >= 0) { used[j] = true; out[i] = j; }
+  });
+  return out;
+}
+
 async function fillBatch(fs) {
   batch = { papers: [], answers: [] };
   bootDiag('📂 正在读取 ' + fs.length + ' 个文件…', false);
@@ -2155,28 +2204,42 @@ async function fillBatch(fs) {
       batch.answers.push({ name: f.name, text: '', bad: true, err: (e && e.message) || String(e) });
     }
   }
+  if (!batch.papers.length) {
+    toast('没有识别到试卷，请确认选中的是真题文件');
+  }
+  /* 关键：把每份答案配到对应的卷子上。
+     绝不能把 15 份答案合并成一份套到每套卷子上，否则每套卷子的同一题号
+     都会拿到同一份答案 —— 那就是"答案全错"。 */
+  batch.pair = pairByAnswerSignature(batch.papers, batch.answers);
   showBatchDialog();
 }
 
 function showBatchDialog() {
   if (!batch) return;
-  const ansText = batch.answers.filter(a => a.text).map(a => a.text).join('\n');
   const rows = batch.papers.map((p, i) => {
     const secs = p.r.sections.map(s => s.short + ' ' + s.blocks.reduce((n, b) => n + b.questions.length, 0)).join(' · ');
-    return `<li><b>${esc(p.name)}</b><br><span class="muted">${esc(secs)} ｜ 共 ${p.r.total} 题</span></li>`;
+    const ai = batch.pair ? batch.pair[i] : null;
+    const ansName = ai != null ? batch.answers[ai].name : '';
+    const matched = ansName && ansSignature(ansName) === ansSignature(p.name);
+    return `<li><b>${esc(p.name)}</b><br><span class="muted">${esc(secs)} ｜ 共 ${p.r.total} 题</span>
+      <br><span class="${ansName ? '' : 'warn'}" style="display:inline;font-size:12px">
+      ${ansName ? '答案：' + esc(ansName) + (matched ? ' ✔' : '（按年月自动配对）') : '⚠ 没有配到答案，需要手动补充'}</span></li>`;
   }).join('');
-  const fileRows = batch.answers.map(a => `<li class="muted">${esc(a.name)}${a.bad ? ' —— <span class="warn" style="display:inline">没读到文字' + (a.err ? '：' + esc(a.err) : '') + '</span>' : ''}</li>`).join('');
   const totalQ = batch.papers.reduce((n, p) => n + p.r.total, 0);
+  const paired = batch.pair ? batch.pair.filter(x => x != null).length : 0;
 
   modal(`<div class="dlg">
     <h3>批量导入确认</h3>
-    <p class="muted">已读取 ${batch.papers.length} 份试卷 + ${batch.answers.length} 个答案文件。</p>
-    <p class="muted">识别到 <b>${batch.papers.length}</b> 套试卷，共 <b>${totalQ}</b> 题。</p>
+    <p class="muted">已读取 ${batch.papers.length} 份试卷 + ${batch.answers.length} 个答案文件，
+      其中 <b>${paired}</b> 套已自动配到对应答案。</p>
+    <p class="muted">共 <b>${totalQ}</b> 题。</p>
     ${batch.papers.length ? `<ul class="sum">${rows}</ul>` : '<p class="warn">没有识别到任何试卷。请确认选中的是真题文件。</p>'}
-    ${batch.answers.length ? `<details><summary>用作答案的 ${batch.answers.length} 个文件</summary><ul class="sum">${fileRows}</ul></details>` : '<p class="warn">这次没有选中答案文件，保存后需要自己补充答案（在资料详情页点「补充答案」）。</p>'}
-    <label class="muted" style="display:block;margin-top:8px">答案（这些答案会套用到上面每一套卷子；可手动补充或修改）</label>
-    <textarea id="mAns" style="min-height:90px" placeholder="${esc(ANS_HINT)}">${esc(ansText.slice(0, 20000))}</textarea>
-    <p class="muted" id="mAnsPreview"></p>
+    <details style="margin-top:10px">
+      <summary>想手动补充 / 修改答案？点这里</summary>
+      <p class="muted" style="margin-top:6px">上面每套卷子已经用<b>它自己那份答案</b>填好了。只有当你发现某几题不对时，才在这里填写。<br>
+      <b>注意</b>：这里填的内容会套用到<b>所有</b>卷子，会覆盖自动配对的答案，所以只填要修的那几题，例如 <code>51C 52A</code>。</p>
+      <textarea id="mAns" style="min-height:70px" placeholder="${esc(ANS_HINT)}"></textarea>
+    </details>
     <div class="btns">
       <button class="ghost" data-act="close">取消</button>
       <button class="primary" data-act="confirmBatch"${batch.papers.length ? '' : ' disabled'}>全部保存到资料库</button>
@@ -2186,28 +2249,33 @@ function showBatchDialog() {
 
 function confirmBatch() {
   if (!batch) return;
-  const fromBox = (($('#mAns') || {}).value || '');
-  // 优先用文本框里（用户可能改过）；拿不到就用已读到的答案原文
-  const av = fromBox.trim() ? fromBox : batch.answers.filter(a => a.text).map(a => a.text).join('\n');
-  let saved = 0, missTotal = 0;
-  batch.papers.forEach(p => {
-    applyAnswerInput(p.r, av);
+  // 文本框留空 → 用各卷自己配对的答案；填了内容 → 当成"统一手动修正"，覆盖所有卷子
+  const manual = (($('#mAns') || {}).value || '').trim();
+  let saved = 0, missTotal = 0, noAns = 0;
+  batch.papers.forEach((p, i) => {
+    const ai = batch.pair ? batch.pair[i] : null;
+    const own = (ai != null) ? batch.answers[ai].text : '';
+    const r = JSON.parse(JSON.stringify(p.r));
+    if (own) applyAnswerInput(r, own);            // 先套用它自己的答案
+    if (manual) applyAnswerInput(r, manual);      // 再用手动修正覆盖
     const meta = detectMeta(p.name, p.raw);
     const label = buildLabel(meta, p.name);
     const paper = Object.assign({
       id: 'p_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-      label, sections: p.r.sections, created: Date.now(), hash: contentHash(p.raw)
+      label, sections: r.sections, created: Date.now(), hash: contentHash(p.raw)
     }, meta);
     papers.push(paper);
     saved++;
     const qs = allQuestions(paper);
-    missTotal += qs.filter(q => !q.ans).length;
+    const miss = qs.filter(q => !q.ans).length;
+    missTotal += miss;
+    if (miss === qs.length) noAns++;
   });
   store.set('plsc_papers', papers);
   batch = null;
   closeModal();
   view = 'library'; render();
-  toast('已保存 ' + saved + ' 套资料' + (missTotal ? '，其中 ' + missTotal + ' 题没有答案' : '，答案齐全'));
+  toast('已保存 ' + saved + ' 套资料' + (missTotal ? '，其中 ' + missTotal + ' 题没有答案' : '，答案全部齐全') + (noAns ? '（有 ' + noAns + ' 套完全没配到答案）' : ''));
 }
 
 /* ===================== 练习 / 模考 ===================== */
@@ -2823,7 +2891,7 @@ function boot() {
     }
     const navEl = document.getElementById('nav');
     const navOk = !!(navEl && navEl.querySelectorAll('button').length >= 5);
-    bootDiag('✅ 程序已就绪（v10）：导航 5 个按钮' + (navOk ? '正常' : '异常') +
+    bootDiag('✅ 程序已就绪（v11）：导航 5 个按钮' + (navOk ? '正常' : '异常') +
       '，资料 ' + papers.length + ' 套，生词 ' + vocab.length + ' 个。点「资料库」试试。', false);
     if (!store.diskOK) setTimeout(showStorageWarn, 300);
   } catch (e) {
